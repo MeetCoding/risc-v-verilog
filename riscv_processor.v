@@ -1,180 +1,279 @@
-`default_nettype none
-
-module riscv_processor (
-    input wire clk,
-    input wire reset,
-
-    // Instruction Memory Interface
-    output wire [31:0] imem_addr,
-    input  wire [31:0] imem_rdata,
-
-    // Data Memory Interface
-    output wire [31:0] dmem_addr,
-    output wire [31:0] dmem_wdata,
-    output reg  [3:0]  dmem_wmask,
-    output wire        dmem_rstrb,
-    input  wire [31:0] dmem_rdata
+module riscv_processor #(
+    parameter RESET_ADDR = 32'h00000000,
+    parameter ADDR_WIDTH = 32
+) (
+    input  wire        clk,
+    input  wire        reset,         // Active Low Reset
+    output reg  [31:0] mem_addr,
+    output reg  [31:0] mem_wdata,
+    output reg  [3:0]  mem_wmask,
+    input  wire [31:0] mem_rdata,
+    output reg         mem_rstrb,
+    input  wire        mem_rbusy,
+    input  wire        mem_wbusy
 );
 
-    // Core State
-    reg [31:0] pc;
-    reg [31:0] rf [1:31];
+    //--------------------------------------------------------------------------
+    // State Machine Definitions
+    //--------------------------------------------------------------------------
+    localparam S_FETCH     = 3'd0;
+    localparam S_DECODE    = 3'd1;
+    localparam S_MEM_READ  = 3'd2;
+    localparam S_MEM_WB    = 3'd3;
+    localparam S_MEM_WRITE = 3'd4;
 
-    // Instruction Fetch & Decode
-    assign imem_addr = pc;
-    wire [31:0] inst = imem_rdata;
-    wire [6:0]  opcode = inst[6:0];
-    wire [4:0]  rd     = inst[11:7];
-    wire [2:0]  funct3 = inst[14:12];
-    wire [4:0]  rs1    = inst[19:15];
-    wire [4:0]  rs2    = inst[24:20];
-    wire [6:0]  funct7 = inst[31:25];
+    reg [2:0]  state;
+    reg [31:0] PC;
 
-    // Register File Read (x0 is hardwired to 0)
-    wire [31:0] rs1_data = (rs1 != 0) ? rf[rs1] : 32'b0;
-    wire [31:0] rs2_data = (rs2 != 0) ? rf[rs2] : 32'b0;
+    // Execution tracking registers (used to hold values across memory states)
+    reg [31:0] alu_out_reg;
+    reg [31:0] rs2_reg;
+    reg [4:0]  rd_reg;
+    reg [2:0]  funct3_reg;
 
-    // Immediate Generation
-    reg [31:0] imm;
+    //--------------------------------------------------------------------------
+    // Register File
+    //--------------------------------------------------------------------------
+    reg [31:0] regfile [1:31];
+    integer i;
+
+    //--------------------------------------------------------------------------
+    // Instruction Decoding (Combinatorial in S_DECODE)
+    //--------------------------------------------------------------------------
+    wire [31:0] instr  = mem_rdata;
+    wire [6:0]  opcode = instr[6:0];
+    wire [2:0]  funct3 = instr[14:12];
+    wire [6:0]  funct7 = instr[31:25];
+    wire [4:0]  rs1    = instr[19:15];
+    wire [4:0]  rs2    = instr[24:20];
+    wire [4:0]  rd     = instr[11:7];
+
+    wire [31:0] rv1 = (rs1 == 0) ? 32'b0 : regfile[rs1];
+    wire [31:0] rv2 = (rs2 == 0) ? 32'b0 : regfile[rs2];
+
+    // Immediate generation
+    wire [31:0] imm_I = {{20{instr[31]}}, instr[31:20]};
+    wire [31:0] imm_S = {{20{instr[31]}}, instr[31:25], instr[11:7]};
+    wire [31:0] imm_B = {{20{instr[31]}}, instr[7], instr[30:25], instr[11:8], 1'b0};
+    wire [31:0] imm_U = {instr[31:12], 12'b0};
+    wire [31:0] imm_J = {{12{instr[31]}}, instr[19:12], instr[20], instr[30:21], 1'b0};
+
+    //--------------------------------------------------------------------------
+    // ALU Wiring & Control
+    //--------------------------------------------------------------------------
+    wire [31:0] alu_op1 = rv1;
+    wire [31:0] alu_op2 = (opcode == 7'b0110011 || opcode == 7'b1100011) ? rv2 : imm_I;
+    
+    reg  [3:0]  alu_ctrl;
+    wire [31:0] alu_out;
+    wire        zero, lt, ltu;
+
+    riscv_alu ALU (
+        .a(alu_op1),
+        .b(alu_op2),
+        .ctrl(alu_ctrl),
+        .res(alu_out),
+        .zero(zero),
+        .lt(lt),
+        .ltu(ltu)
+    );
+
     always @(*) begin
-        case (opcode)
-            7'b0010011, 7'b0000011, 7'b1100111: imm = {{20{inst[31]}}, inst[31:20]}; // I-Type
-            7'b0100011: imm = {{20{inst[31]}}, inst[31:25], inst[11:7]}; // S-Type
-            7'b1100011: imm = {{20{inst[31]}}, inst[7], inst[30:25], inst[11:8], 1'b0}; // B-Type
-            7'b0110111, 7'b0010111: imm = {inst[31:12], 12'b0}; // U-Type
-            7'b1101111: imm = {{12{inst[31]}}, inst[19:12], inst[20], inst[30:21], 1'b0}; // J-Type
-            default: imm = 32'b0;
-        endcase
-    end
-
-    // ALU Operations
-    wire [31:0] alu_a = (opcode == 7'b0010111) ? pc : rs1_data; // AUIPC uses PC, else rs1
-    wire [31:0] alu_b = (opcode == 7'b0110011) ? rs2_data : imm; // R-Type Arith uses rs2, else imm
-    reg  [31:0] alu_result;
-
-    always @(*) begin
-        if (opcode == 7'b0110011 || opcode == 7'b0010011) begin // R-Type & I-Type Arith
+        alu_ctrl = 4'b0000; // Default ADD
+        if (opcode == 7'b0110011) begin        // R-type
             case (funct3)
-                3'b000: alu_result = (opcode == 7'b0110011 && funct7[5]) ? alu_a - alu_b : alu_a + alu_b; // ADD/SUB
-                3'b001: alu_result = alu_a << alu_b[4:0]; // SLL
-                3'b010: alu_result = {31'b0, $signed(alu_a) < $signed(alu_b)}; // SLT
-                3'b011: alu_result = {31'b0, alu_a < alu_b}; // SLTU
-                3'b100: alu_result = alu_a ^ alu_b; // XOR
-                3'b101: alu_result = funct7[5] ? $signed(alu_a) >>> alu_b[4:0] : alu_a >> alu_b[4:0]; // SRA/SRL
-                3'b110: alu_result = alu_a | alu_b; // OR
-                3'b111: alu_result = alu_a & alu_b; // AND
+                3'b000: alu_ctrl = (funct7 == 7'b0100000) ? 4'b0001 : 4'b0000; // SUB : ADD
+                3'b001: alu_ctrl = 4'b0010; // SLL
+                3'b010: alu_ctrl = 4'b0011; // SLT
+                3'b011: alu_ctrl = 4'b0100; // SLTU
+                3'b100: alu_ctrl = 4'b0101; // XOR
+                3'b101: alu_ctrl = (funct7 == 7'b0100000) ? 4'b0111 : 4'b0110; // SRA : SRL
+                3'b110: alu_ctrl = 4'b1000; // OR
+                3'b111: alu_ctrl = 4'b1001; // AND
             endcase
-        end else if (opcode == 7'b0110111) begin // LUI
-            alu_result = imm;
-        end else begin // Default ADD for Loads, Stores, AUIPC
-            alu_result = alu_a + alu_b;
+        end else if (opcode == 7'b0010011) begin // I-type ALU
+            case (funct3)
+                3'b000: alu_ctrl = 4'b0000; // ADD
+                3'b001: alu_ctrl = 4'b0010; // SLL
+                3'b010: alu_ctrl = 4'b0011; // SLT
+                3'b011: alu_ctrl = 4'b0100; // SLTU
+                3'b100: alu_ctrl = 4'b0101; // XOR
+                3'b101: alu_ctrl = (funct7 == 7'b0100000) ? 4'b0111 : 4'b0110; // SRAI : SRLI
+                3'b110: alu_ctrl = 4'b1000; // OR
+                3'b111: alu_ctrl = 4'b1001; // AND
+            endcase
         end
     end
 
-    // Branch Conditions
-    reg take_branch;
+    //--------------------------------------------------------------------------
+    // Branch Resolution
+    //--------------------------------------------------------------------------
+    reg branch_taken;
     always @(*) begin
-        take_branch = 0;
+        branch_taken = 1'b0;
         if (opcode == 7'b1100011) begin
             case (funct3)
-                3'b000: take_branch = (rs1_data == rs2_data); // BEQ
-                3'b001: take_branch = (rs1_data != rs2_data); // BNE
-                3'b100: take_branch = ($signed(rs1_data) < $signed(rs2_data)); // BLT
-                3'b101: take_branch = ($signed(rs1_data) >= $signed(rs2_data)); // BGE
-                3'b110: take_branch = (rs1_data < rs2_data); // BLTU
-                3'b111: take_branch = (rs1_data >= rs2_data); // BGEU
-                default: take_branch = 0;
+                3'b000: branch_taken = zero;   // BEQ
+                3'b001: branch_taken = !zero;  // BNE
+                3'b100: branch_taken = lt;     // BLT
+                3'b101: branch_taken = !lt;    // BGE
+                3'b110: branch_taken = ltu;    // BLTU
+                3'b111: branch_taken = !ltu;   // BGEU
+                default: branch_taken = 1'b0;
             endcase
         end
     end
 
-    // Memory Interface Output
-    wire is_load  = (opcode == 7'b0000011);
-    wire is_store = (opcode == 7'b0100011);
-    
-    assign dmem_addr  = alu_result;
-    assign dmem_rstrb = is_load;
-    
-    // Align write data to byte lanes for testbench integration
-    reg [31:0] wdata_shifted;
+    //--------------------------------------------------------------------------
+    // Data Memory Alignment Logic (Combinatorial)
+    //--------------------------------------------------------------------------
+    // -- Store Formatting --
+    reg [31:0] store_wdata;
+    reg [3:0]  store_wmask;
     always @(*) begin
-        case (funct3)
-            3'b000: wdata_shifted = {4{rs2_data[7:0]}};  // SB (Repeat byte)
-            3'b001: wdata_shifted = {2{rs2_data[15:0]}}; // SH (Repeat halfword)
-            default: wdata_shifted = rs2_data;           // SW
+        store_wdata = 32'b0;
+        store_wmask = 4'b0000;
+        case (funct3_reg)
+            3'b000: begin // SB (Store Byte)
+                store_wdata = {4{rs2_reg[7:0]}}; // Broadcast byte to all lanes
+                store_wmask = (4'b0001 << alu_out_reg[1:0]);
+            end
+            3'b001: begin // SH (Store Halfword)
+                store_wdata = {2{rs2_reg[15:0]}}; // Broadcast halfword to all lanes
+                store_wmask = alu_out_reg[1] ? 4'b1100 : 4'b0011;
+            end
+            3'b010: begin // SW (Store Word)
+                store_wdata = rs2_reg;
+                store_wmask = 4'b1111;
+            end
         endcase
     end
-    assign dmem_wdata = wdata_shifted;
+
+    // -- Load Formatting --
+    reg [31:0] load_formatted_data;
+    wire [7:0] load_byte = (alu_out_reg[1:0] == 2'b00) ? mem_rdata[7:0]  :
+                           (alu_out_reg[1:0] == 2'b01) ? mem_rdata[15:8] :
+                           (alu_out_reg[1:0] == 2'b10) ? mem_rdata[23:16] : mem_rdata[31:24];
+    
+    wire [15:0] load_half = (alu_out_reg[1] == 1'b0) ? mem_rdata[15:0] : mem_rdata[31:16];
 
     always @(*) begin
-        dmem_wmask = 4'b0000;
-        if (is_store) begin
-            case (funct3)
-                3'b000: dmem_wmask = 4'b0001 << alu_result[1:0];
-                3'b001: dmem_wmask = 4'b0011 << alu_result[1:0];
-                3'b010: dmem_wmask = 4'b1111;
-                default: dmem_wmask = 4'b0000;
-            endcase
-        end
+        case (funct3_reg)
+            3'b000: load_formatted_data = {{24{load_byte[7]}}, load_byte};   // LB (Sign extend byte)
+            3'b001: load_formatted_data = {{16{load_half[15]}}, load_half};  // LH (Sign extend half)
+            3'b010: load_formatted_data = mem_rdata;                         // LW (Direct pass)
+            3'b100: load_formatted_data = {24'b0, load_byte};                // LBU (Zero extend byte)
+            3'b101: load_formatted_data = {16'b0, load_half};                // LHU (Zero extend half)
+            default: load_formatted_data = mem_rdata;
+        endcase
     end
 
-    // Read Data Alignment & Extension
-    reg [31:0] load_data;
+    //--------------------------------------------------------------------------
+    // Memory Interface Outputs (Combinatorial tracking of state)
+    //--------------------------------------------------------------------------
     always @(*) begin
-        load_data = dmem_rdata;
-        if (is_load) begin
-            case (funct3)
-                3'b000: begin // LB
-                    case (alu_result[1:0])
-                        2'b00: load_data = {{24{dmem_rdata[7]}}, dmem_rdata[7:0]};
-                        2'b01: load_data = {{24{dmem_rdata[15]}}, dmem_rdata[15:8]};
-                        2'b10: load_data = {{24{dmem_rdata[23]}}, dmem_rdata[23:16]};
-                        2'b11: load_data = {{24{dmem_rdata[31]}}, dmem_rdata[31:24]};
-                    endcase
-                end
-                3'b001: load_data = alu_result[1] ? {{16{dmem_rdata[31]}}, dmem_rdata[31:16]} : {{16{dmem_rdata[15]}}, dmem_rdata[15:0]}; // LH
-                3'b010: load_data = dmem_rdata; // LW
-                3'b100: begin // LBU
-                    case (alu_result[1:0])
-                        2'b00: load_data = {24'b0, dmem_rdata[7:0]};
-                        2'b01: load_data = {24'b0, dmem_rdata[15:8]};
-                        2'b10: load_data = {24'b0, dmem_rdata[23:16]};
-                        2'b11: load_data = {24'b0, dmem_rdata[31:24]};
-                    endcase
-                end
-                3'b101: load_data = alu_result[1] ? {16'b0, dmem_rdata[31:16]} : {16'b0, dmem_rdata[15:0]}; // LHU
-            endcase
-        end
-    end
-
-    // Write Back
-    wire is_jal  = (opcode == 7'b1101111);
-    wire is_jalr = (opcode == 7'b1100111);
-    wire reg_write_en = (opcode == 7'b0110011 || opcode == 7'b0010011 || is_load || 
-                         opcode == 7'b0110111 || opcode == 7'b0010111 || is_jal || is_jalr);
-
-    wire [31:0] reg_write_data = 
-        (is_load) ? load_data :
-        (is_jal || is_jalr) ? pc + 4 :
-        alu_result;
-
-    // PC Calculation
-    wire [31:0] next_pc =
-        (take_branch || is_jal) ? pc + imm :
-        (is_jalr)               ? (rs1_data + imm) & 32'hFFFFFFFE :
-        pc + 4;
-
-    // Clocked Sequence Updates
-    integer i;
-    always @(posedge clk) begin
-        if (reset) begin
-            pc <= 32'b0;
-            for (i = 1; i < 32; i = i + 1) rf[i] <= 32'b0;
-        end else begin
-            pc <= next_pc;
-            if (reg_write_en && rd != 0) begin
-                rf[rd] <= reg_write_data;
+        mem_addr  = 32'b0;
+        mem_rstrb = 1'b0;
+        mem_wdata = 32'b0;
+        mem_wmask = 4'b0;
+        
+        case (state)
+            S_FETCH, S_DECODE: begin
+                mem_addr  = PC;
+                mem_rstrb = (state == S_FETCH);
             end
+            S_MEM_READ: begin
+                mem_addr  = alu_out_reg;
+                mem_rstrb = 1'b1;
+            end
+            S_MEM_WRITE: begin
+                mem_addr  = alu_out_reg;
+                mem_wdata = store_wdata;
+                mem_wmask = store_wmask;
+            end
+        endcase
+    end
+
+    //--------------------------------------------------------------------------
+    // Synchronous Main FSM
+    //--------------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (!reset) begin
+            state <= S_FETCH;
+            PC    <= RESET_ADDR;
+            for (i = 1; i < 32; i = i + 1) regfile[i] <= 32'b0;
+        end else begin
+            case (state)
+                S_FETCH: begin
+                    // Wait for instruction fetch to clear busy line
+                    if (!mem_rbusy) state <= S_DECODE;
+                end
+                
+                S_DECODE: begin
+                    if (opcode == 7'b0000011) begin      // LOAD
+                        alu_out_reg <= rv1 + imm_I;
+                        rd_reg      <= rd;
+                        funct3_reg  <= funct3;
+                        state       <= S_MEM_READ;
+                        
+                    end else if (opcode == 7'b0100011) begin // STORE
+                        alu_out_reg <= rv1 + imm_S;
+                        rs2_reg     <= rv2;
+                        funct3_reg  <= funct3;
+                        state       <= S_MEM_WRITE;
+                        
+                    end else begin
+                        // Fast Execute for ALU, Branches, and Jumps
+                        state <= S_FETCH; 
+                        case (opcode)
+                            7'b0110011, 7'b0010011: begin // R-type & I-type ALU
+                                if (rd != 0) regfile[rd] <= alu_out;
+                                PC <= PC + 4;
+                            end
+                            7'b1100011: begin // B-type Branch
+                                if (branch_taken) PC <= PC + imm_B;
+                                else PC <= PC + 4;
+                            end
+                            7'b1101111: begin // JAL
+                                if (rd != 0) regfile[rd] <= PC + 4;
+                                PC <= PC + imm_J;
+                            end
+                            7'b1100111: begin // JALR
+                                if (rd != 0) regfile[rd] <= PC + 4;
+                                PC <= (rv1 + imm_I) & ~32'd1;
+                            end
+                            7'b0110111: begin // LUI
+                                if (rd != 0) regfile[rd] <= imm_U;
+                                PC <= PC + 4;
+                            end
+                            7'b0010111: begin // AUIPC
+                                if (rd != 0) regfile[rd] <= PC + imm_U;
+                                PC <= PC + 4;
+                            end
+                            default: PC <= PC + 4; // Skip unknown/unsupported
+                        endcase
+                    end
+                end
+                
+                S_MEM_READ: begin
+                    if (!mem_rbusy) state <= S_MEM_WB;
+                end
+                
+                S_MEM_WB: begin
+                    if (rd_reg != 0) regfile[rd_reg] <= load_formatted_data;
+                    PC <= PC + 4;
+                    state <= S_FETCH;
+                end
+                
+                S_MEM_WRITE: begin
+                    if (!mem_wbusy) begin
+                        PC <= PC + 4;
+                        state <= S_FETCH;
+                    end
+                end
+                
+                default: state <= S_FETCH;
+            endcase
         end
     end
 
