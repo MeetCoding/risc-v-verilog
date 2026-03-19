@@ -55,16 +55,40 @@ module riscv_processor #(parameter RESET_ADDR=32'h0, parameter ADDR_WIDTH=32)(
 
     // Sequential Core (Main FSM)
     always @(posedge clk) begin
-        if(!reset) begin state <= 0; PC <= RESET_ADDR; end
+        if(!reset) begin 
+            state <= 0; 
+            PC <= RESET_ADDR; 
+        end
         else case(state)
             3'd0: if(!mem_rbusy) state <= 3'd1;                                // S_FETCH
-            3'd1: begin instr <= mem_rdata; state <= 3'd2; end                 // S_FETCH_WAIT
-            3'd2: if(op==7'b0000011) begin alu_out_reg <= rv1+iI; rd_reg<=rd; funct3_reg<=f3; state<=3'd3; end  // LOAD
-                  else if(op==7'b0100011) begin alu_out_reg <= rv1+iS; rs2_reg<=rv2; funct3_reg<=f3; state<=3'd5; end // STORE
-                  else begin PC <= next_pc; state <= 3'd0; end                 // FAST EXECUTE
+            3'd1: begin 
+                    instr <= mem_rdata; 
+                    state <= 3'd2; 
+                end                 // S_FETCH_WAIT
+            3'd2: if(op==7'b0000011) begin 
+                    alu_out_reg <= rv1+iI; 
+                    rd_reg<=rd; funct3_reg<=f3; 
+                    state<=3'd3; 
+                end  // LOAD
+                  else if(op==7'b0100011) begin 
+                    alu_out_reg <= rv1+iS; 
+                    rs2_reg<=rv2; 
+                    funct3_reg<=f3; 
+                    state<=3'd5; 
+                end // STORE
+                  else begin 
+                    PC <= next_pc; 
+                    state <= 3'd0; 
+                end                 // FAST EXECUTE
             3'd3: if(!mem_rbusy) state <= 3'd4;                                // S_MEM_READ
-            3'd4: begin PC <= PC + 4; state <= 3'd0; end                       // S_MEM_WB
-            3'd5: if(!mem_wbusy) begin PC <= PC + 4; state <= 3'd0; end        // S_MEM_WRITE
+            3'd4: begin 
+                    PC <= PC + 4; 
+                    state <= 3'd0; 
+                end                       // S_MEM_WB
+            3'd5: if(!mem_wbusy) begin 
+                    PC <= PC + 4; 
+                    state <= 3'd0; 
+                end        // S_MEM_WRITE
         endcase
     end
 endmodule
